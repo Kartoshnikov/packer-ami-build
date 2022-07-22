@@ -1,0 +1,147 @@
+workflow:
+  rules:
+  - if: $CI_COMMIT_BRANCH
+
+variables:
+  PKR_VAR_AWS_REGION: $AWS_DEFAULT_REGION
+  PKR_VAR_PACKER_VPC_NAME: $PACKER_VPC_NAME
+
+stages:
+- validate
+- build
+- update
+- delete
+
+
+###############
+## Validate Packer
+###############
+.Validate:
+  image: 
+    name: hashicorp/packer:1.7.8
+    entrypoint:
+    - '/usr/bin/env'
+    - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  stage: validate
+  script:
+  - packer init $TEMPLATE_NAME
+  - packer validate $TEMPLATE_NAME
+
+Validate Admin Config:
+  extends: .Validate
+  variables:
+    TEMPLATE_NAME: admin.pkr.hcl
+
+Validate Worker Config:
+  extends: .Validate
+  variables:
+    TEMPLATE_NAME: worker.pkr.hcl
+
+
+###############
+## Build AMIs
+###############
+.Build:
+  image: 
+    name: hashicorp/packer:1.7.8
+    entrypoint:
+    - '/usr/bin/env'
+    - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  stage: build
+  rules:
+  - if: '$CI_COMMIT_REF_NAME == "master"'
+    when: manual
+  before_script:
+  - packer init $TEMPLATE_NAME
+  script:
+  - packer build -machine-readable $TEMPLATE_NAME | tee build.log
+  - awk '/artifact,0,id/{match($0, /ami-.*/); print substr($0, RSTART, RLENGTH)}' build.log > ami.txt
+  artifacts:
+    paths: [ami.txt]
+
+Build Admin AMI:
+  extends: .Build
+  needs: ["Validate Admin Config"]
+  variables:
+    TEMPLATE_NAME: admin.pkr.hcl
+
+Build Worker AMI:
+  extends: .Build
+  needs: ["Validate Worker Config"]
+  variables:
+    TEMPLATE_NAME: worker.pkr.hcl
+
+
+###############
+## Update SSM Parameters
+###############
+.Update:
+  image: 
+    name: amazon/aws-cli
+    entrypoint: [""]
+  stage: update
+  rules:
+  - if: '$CI_COMMIT_REF_NAME == "master"'
+    when: manual
+  script:
+  - |
+    if aws ssm get-parameter --name $SSM_PARAM_NAME &> /dev/null; then
+      aws ssm put-parameter --name $SSM_PARAM_NAME --value "$(cat ami.txt)" --type String --data-type "aws:ec2:image" --overwrite
+    else
+      aws ssm put-parameter --name $SSM_PARAM_NAME --value "$(cat ami.txt)" --type String --data-type "aws:ec2:image" --tags "Key=Project,Value=PMS"
+    fi
+
+Update Admin AMI Prod:
+  extends: .Update
+  needs: ["Build Admin AMI"]
+  variables:
+    SSM_PARAM_NAME: $ADMIN_AMI_SSM_NAME-prod
+
+Update Admin AMI DEV:
+  extends: .Update
+  needs: ["Build Admin AMI"]
+  variables:
+    SSM_PARAM_NAME: $ADMIN_AMI_SSM_NAME-dev
+
+Update Worker AMI Prod:
+  extends: .Update
+  needs: ["Build Worker AMI"]
+  variables:
+    SSM_PARAM_NAME: $WORKER_AMI_SSM_NAME-prod
+
+Update Worker AMI DEV:
+  extends: .Update
+  needs: ["Build Worker AMI"]
+  variables:
+    SSM_PARAM_NAME: $WORKER_AMI_SSM_NAME-dev
+
+
+###############
+## AMI CleanUp
+###############
+
+.Delete:
+  image: python:3.8.12-slim
+  stage: delete
+  rules:
+  - if: $CI_COMMIT_REF_NAME == "master"
+    when: manual
+  before_script:
+  - pip install boto3
+  script:
+  - cat ami.txt
+  - python deregister_ami.py -i "$(cat ami.txt)"
+
+Delete Admin AMI:
+  extends: .Delete
+  needs: ["Build Admin AMI"]
+
+Delete Worker AMI:
+  extends: .Delete
+  needs: ["Build Worker AMI"]
+
+Clean Up:
+  extends: .Delete
+  needs: []
+  script:
+  - python clean-up.py

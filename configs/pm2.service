@@ -1,0 +1,17 @@
+[Unit]
+Description=PM2 process manager
+Documentation=https://pm2.keymetrics.io/
+After=network.target
+
+[Service]
+Type=forking
+WorkingDirectory=/srv/app/
+KillMode=process
+Restart=on-failure
+RestartSec=60s
+
+ExecStart=/usr/bin/pm2 start /srv/app/pm2.yaml
+ExecStop=/usr/bin/pm2 kill
+
+[Install]
+WantedBy=multi-user.target
